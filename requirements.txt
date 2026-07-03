@@ -1,0 +1,9 @@
+streamlit>=1.35
+pyyaml>=6.0
+python-docx>=1.1
+# Phase 1 additions (uncomment when building core/):
+# anthropic>=0.34
+# rapidfuzz>=3.9
+# pydantic>=2.7
+# pytest>=8.2
+# ruff>=0.5

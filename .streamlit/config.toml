@@ -1,0 +1,9 @@
+# Place this file at:  cv-tailoring-agent\.streamlit\config.toml
+# (create the .streamlit folder in the project root)
+[theme]
+base = "light"
+primaryColor = "#0E7C7B"
+backgroundColor = "#F7F9FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2933"
+font = "sans serif"

@@ -1,0 +1,13 @@
+# rename this file to .gitignore in your repo root — BEFORE the first commit
+.venv/
+venv/
+.env
+data/
+outputs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.env
+.env.local
