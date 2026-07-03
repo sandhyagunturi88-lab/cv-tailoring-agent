@@ -7,3 +7,7 @@ backgroundColor = "#F7F9FB"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#1F2933"
 font = "sans serif"
+baseFontSize = 18
+
+[client]
+toolbarMode = "minimal"

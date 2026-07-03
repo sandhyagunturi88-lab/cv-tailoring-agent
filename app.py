@@ -273,6 +273,7 @@ TEAL, RED = "#0E7C7B", "#B4423A"
 _CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&display=swap');
+html { font-size:120%; }
 html, body, [data-testid="stAppViewContainer"] { font-family:'Source Sans 3',system-ui,sans-serif; }
 [data-testid="stAppViewContainer"] { background:#F7F9FB; color:#1F2933; }
 [data-testid="stHeader"] { background:transparent; }
@@ -304,6 +305,15 @@ p, span, label, div { color:#1F2933; }
 /* Secondary / plain buttons (e.g. checkbox-adjacent, radio) keep readable text on light bg */
 [data-testid="stRadio"] label, [data-testid="stCheckbox"] label { color:#1F2933 !important; }
 
+/* Sidebar logo — plain icon button, overrides the teal button fill above (declared later = wins) */
+.st-key-logo_home button {
+  background:transparent !important; border:none !important;
+  padding:8px 0 4px 0 !important; box-shadow:none !important;
+}
+.st-key-logo_home button p { font-size:4.5rem !important; line-height:1 !important; color:#E6EAEE !important; }
+.st-key-logo_home button:hover p { color:#2DBDBA !important; }
+.st-key-logo_home { margin-bottom:-4px; }
+
 /* File uploader (sidebar) — dark dropzone matches the sidebar card, teal Browse button */
 [data-testid="stFileUploaderDropzone"] {
   background:#2A3441 !important; border:1px dashed #4A5568 !important; border-radius:8px !important;
@@ -322,7 +332,7 @@ p, span, label, div { color:#1F2933; }
 [data-testid="stFileUploaderFile"] { background:#2A3441 !important; border-radius:8px !important; }
 [data-testid="stFileUploaderFile"] * { color:#E6EAEE !important; }
 
-textarea { border-radius:8px !important; color:#1F2933 !important; background:#FFFFFF !important; }
+textarea, input[type="text"] { border-radius:8px !important; color:#1F2933 !important; background:#FFFFFF !important; }
 
 .cva-chip{display:inline-block;background:#E3F2F1;color:#0A5C5B;border:1px solid #9AD5D4;
   border-radius:14px;padding:2px 12px;margin:0 6px 6px 0;font-size:.85rem;font-weight:600}
@@ -334,6 +344,11 @@ textarea { border-radius:8px !important; color:#1F2933 !important; background:#F
   border-radius:4px;padding:1px 8px;letter-spacing:.03em}
 .cva-ev-err{color:#B4423A;background:#F9ECEB}
 .cva-gapbox{background:#FBF3F2;border:1px solid #E5B7B2;border-radius:10px;padding:12px 16px;margin:8px 0;color:#1F2933}
+
+/* Sidebar upload callout — overrides the blanket light-text rule below so it reads on the dark card */
+.cva-sidebar-cta{background:rgba(14,124,123,.22);border:1px solid #0E7C7B;border-radius:8px;
+  padding:10px 12px;margin:10px 0;font-size:.85rem;line-height:1.4}
+.cva-sidebar-cta, .cva-sidebar-cta *{color:#E6EAEE !important}
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)
@@ -346,18 +361,21 @@ ss.setdefault("ticked", set())      # entry ids selected for rewrite
 ss.setdefault("bullets", [])        # validated bullets
 ss.setdefault("decisions", {})      # bullet index -> "accepted"|"rejected"
 
-with st.sidebar:
-    st.markdown("### CV Tailoring Agent")
-    st.caption("local · evidence-only · v2")
-    screen = st.radio("Navigate", ["📇 Inventory", "🎯 Tailor", "✅ Review & Export"], label_visibility="collapsed")
-    st.divider()
-    if MOCK_MODE:
-        st.warning("MOCK MODE — core/ not found. UI runs on the built-in mock backend; build Phase 1 to go live.")
-    else:
-        st.success("Real backend: core/ loaded")
-    st.caption(f"{len(ss.inventory.get('entries', []))} inventory entries")
+if "_nav_next" in ss:  # deferred nav: must land before the radio widget below is instantiated
+    ss["nav_radio"] = ss.pop("_nav_next")
 
+with st.sidebar:
+    if st.button("🛡️", key="logo_home", help="Home", type="tertiary"):
+        st.session_state["nav_radio"] = "📇 Inventory"
+        st.rerun()
+    st.markdown("### CV Tailoring Agent")
+    st.caption(f"local · evidence-only · v2 · {len(ss.inventory.get('entries', []))} entries")
+    screen = st.radio("Navigate", ["📇 Inventory", "🎯 Tailor", "✅ Review & Export"],
+                       key="nav_radio", label_visibility="collapsed")
+    if MOCK_MODE:
+        st.warning("MOCK MODE — core/ not found. Build Phase 1 to go live.", icon="⚠️")
     st.divider()
+
     st.markdown("**Import CV**")
     uploaded = st.file_uploader(
         "Upload .docx / .pdf / .pptx", type=["docx", "pdf", "pptx"], key="cv_upload"
@@ -368,7 +386,6 @@ with st.sidebar:
         upload_dir.mkdir(parents=True, exist_ok=True)
         save_path = upload_dir / uploaded.name
         save_path.write_bytes(raw)
-        st.caption(f"Saved to {save_path}")
 
         try:
             cv_text = extract_cv_text(uploaded.name, raw)
@@ -377,9 +394,17 @@ with st.sidebar:
             cv_text = ""
 
         if cv_text.strip():
-            with st.expander("Preview extracted text"):
-                st.text(cv_text[:3000] + ("…" if len(cv_text) > 3000 else ""))
-            if st.button("➕ Add as inventory entry", key="cv_add_entry"):
+            st.markdown(
+                f"<div class='cva-sidebar-cta'>📄 Extracted {len(cv_text):,} characters from "
+                f"<b>{html.escape(uploaded.name)}</b> — add tags below, then add it as an entry.</div>",
+                unsafe_allow_html=True,
+            )
+            tags_input = st.text_input(
+                "Tags (comma-separated, required)", key="cv_add_tags", placeholder="e.g. scrum-master, agile"
+            )
+            tags = [t.strip() for t in tags_input.split(",") if t.strip()]
+            if st.button("➕ Add as inventory entry", key="cv_add_entry",
+                         use_container_width=True, disabled=not tags):
                 existing_ids = {e["id"] for e in ss.inventory.get("entries", [])}
                 base_id = f"upload-{Path(uploaded.name).stem.lower().replace(' ', '-')}"
                 uid, n = base_id, 1
@@ -391,9 +416,11 @@ with st.sidebar:
                     "id": uid,
                     "claim": first_line[:120],
                     "evidence": cv_text.strip()[:5000],
-                    "tags": [],
+                    "tags": tags,
                 })
-                st.success(f"Added '{uid}' — edit claim/tags on the Inventory screen, then Save.")
+                st.success(f"Added '{uid}' — refine claim/tags on the Inventory screen, then Save.")
+            with st.expander("Preview extracted text"):
+                st.text(cv_text[:3000] + ("…" if len(cv_text) > 3000 else ""))
 
 errors = schema_errors(ss.inventory)
 
@@ -403,33 +430,44 @@ errors = schema_errors(ss.inventory)
 if screen == "📇 Inventory":
     st.subheader("Evidence inventory")
     st.caption("Everything a tailored CV is allowed to say lives here. No entry — no claim.")
+
+    entries = ss.inventory.get("entries", [])
     if errors:
         st.error("SCHEMA INVALID — Tailor is disabled:\n\n- " + "\n- ".join(errors))
-    else:
+    elif entries:
         st.success("SCHEMA VALID ✓")
 
-    rows = [
-        {"id": e["id"], "claim": e["claim"], "evidence": e["evidence"], "tags": ", ".join(e["tags"])}
-        for e in ss.inventory.get("entries", [])
-    ]
-    edited = st.data_editor(rows, num_rows="dynamic", use_container_width=True, key="inv_editor")
-    if st.button("💾 Save to data/inventory.yaml"):
-        new_inv = {
-            "entries": [
-                {"id": r["id"], "claim": r["claim"], "evidence": r["evidence"],
-                 "tags": [t.strip() for t in str(r["tags"]).split(",") if t.strip()]}
-                for r in edited if r.get("id")
-            ]
-        }
-        errs = schema_errors(new_inv)
-        if errs:
-            st.error("Not saved:\n\n- " + "\n- ".join(errs))
-        else:
-            Path("data").mkdir(exist_ok=True)
-            Path("data/inventory.yaml").write_text(yaml.safe_dump(new_inv, sort_keys=False), encoding="utf-8")
-            ss.inventory = new_inv
-            ss.run, ss.bullets, ss.decisions, ss.ticked = None, [], {}, set()  # invalidate stale run
-            st.success("Saved. Previous tailor run cleared. (data/ is gitignored — this never reaches GitHub.)")
+    ss.setdefault("show_manual_entry", False)
+    if not entries and not ss.show_manual_entry:
+        st.info("No entries yet — upload a CV from the sidebar, or add one manually below.")
+        if st.button("➕ Add a blank entry"):
+            ss.show_manual_entry = True
+            st.rerun()
+    else:
+        scaffold = entries or [{"id": "", "claim": "", "evidence": "", "tags": []}]
+        rows = [
+            {"id": e["id"], "claim": e["claim"], "evidence": e["evidence"], "tags": ", ".join(e["tags"])}
+            for e in scaffold
+        ]
+        edited = st.data_editor(rows, num_rows="dynamic", use_container_width=True, key="inv_editor")
+        if any(r.get("id") for r in edited) and st.button("💾 Save your skills to compare against JD"):
+            new_inv = {
+                "entries": [
+                    {"id": r["id"], "claim": r["claim"], "evidence": r["evidence"],
+                     "tags": [t.strip() for t in str(r["tags"]).split(",") if t.strip()]}
+                    for r in edited if r.get("id")
+                ]
+            }
+            errs = schema_errors(new_inv)
+            if errs:
+                st.error("Not saved:\n\n- " + "\n- ".join(errs))
+            else:
+                Path("data").mkdir(exist_ok=True)
+                Path("data/inventory.yaml").write_text(yaml.safe_dump(new_inv, sort_keys=False), encoding="utf-8")
+                ss.inventory = new_inv
+                ss.show_manual_entry = False
+                ss.run, ss.bullets, ss.decisions, ss.ticked = None, [], {}, set()  # invalidate stale run
+                st.success("Saved. Previous tailor run cleared.")
 
 # ---------------------------------------------------------------------------
 # S2 — TAILOR
@@ -443,14 +481,19 @@ elif screen == "🎯 Tailor":
     jd = st.text_area("Paste job description", height=170, placeholder="Senior Scrum Master — ServiceNow & Terraform…")
 
     if st.button("Run tailor →", type="primary", disabled=not jd.strip()):
-        jd_n = normalize_jd(jd)
-        keywords = extract_keywords(jd_n)
-        hits, gaps = match(keywords, ss.inventory)
-        ss.run = {"keywords": keywords, "hits": hits, "gaps": gaps,
-                  "score": fit_score(hits, gaps, keywords)}
-        ss.run_id += 1
-        ss.ticked = set(hits.keys())
-        ss.bullets, ss.decisions = [], {}
+        try:
+            with st.spinner("Extracting keywords…"):
+                jd_n = normalize_jd(jd)
+                keywords = extract_keywords(jd_n)
+                hits, gaps = match(keywords, ss.inventory)
+        except Exception as e:
+            st.error(f"Couldn't run tailor: {e}")
+        else:
+            ss.run = {"keywords": keywords, "hits": hits, "gaps": gaps,
+                      "score": fit_score(hits, gaps, keywords)}
+            ss.run_id += 1
+            ss.ticked = set(hits.keys())
+            ss.bullets, ss.decisions = [], {}
 
     if ss.run:
         r = ss.run
@@ -494,10 +537,16 @@ elif screen == "🎯 Tailor":
 
         if st.button("Rewrite selected evidence →", disabled=not ss.ticked):
             entries = [by_id[i] for i in ss.ticked if i in by_id]  # guard: ids may have been deleted
-            raw = rewrite(entries, r["keywords"])
-            ss.bullets = validate_bullets(raw, ss.inventory)
-            ss.decisions = {}
-            st.success(f"{len(ss.bullets)} bullets generated → go to Review & Export.")
+            try:
+                with st.spinner("Rewriting bullets…"):
+                    raw = rewrite(entries, r["keywords"])
+                    ss.bullets = validate_bullets(raw, ss.inventory)
+            except Exception as e:
+                st.error(f"Couldn't rewrite: {e}")
+            else:
+                ss.decisions = {}
+                ss["_nav_next"] = "✅ Review & Export"
+                st.rerun()
 
 # ---------------------------------------------------------------------------
 # S3 — REVIEW & EXPORT
@@ -545,4 +594,4 @@ else:
             file_name="tailored_cv." + ("docx" if is_docx else "md"),
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document" if is_docx else "text/markdown",
         )
-        st.caption(f"{len(accepted)} accepted bullets. Saved copies belong in outputs/ (gitignored).")
+        st.caption(f"{len(accepted)} accepted bullets.")
