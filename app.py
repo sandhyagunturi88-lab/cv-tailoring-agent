@@ -8,6 +8,7 @@ RUN IT:
     pip install streamlit pyyaml
     streamlit run app.py
 Optional: pip install python-docx   (enables real .docx export; else .md export)
+Optional: pip install python-docx pypdf python-pptx   (enables CV upload/import below)
 
 BACKEND CONTRACT — implement these in Phase 1/2 and mock mode disappears:
     core/ingest.py    load_inventory(path: str) -> dict            # {"entries":[...]}
@@ -199,6 +200,53 @@ if MOCK_MODE:
 # ---------------------------------------------------------------------------
 # Schema check (mirrors pydantic model to come in core/ingest.py)
 # ---------------------------------------------------------------------------
+def _read_docx_text(data: bytes) -> str:
+    from docx import Document  # type: ignore
+
+    doc = Document(io.BytesIO(data))
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
+def _read_pdf_text(data: bytes) -> str:
+    from pypdf import PdfReader  # type: ignore
+
+    reader = PdfReader(io.BytesIO(data))
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
+def _read_pptx_text(data: bytes) -> str:
+    from pptx import Presentation  # type: ignore
+
+    prs = Presentation(io.BytesIO(data))
+    lines = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            for para in shape.text_frame.paragraphs:
+                line = "".join(run.text for run in para.runs)
+                if line.strip():
+                    lines.append(line)
+    return "\n".join(lines)
+
+
+def extract_cv_text(filename: str, data: bytes) -> str:
+    """Best-effort text extraction for uploaded CVs. Raises if the required
+    optional library isn't installed or the format is unsupported."""
+    ext = Path(filename).suffix.lower()
+    readers = {".docx": _read_docx_text, ".pdf": _read_pdf_text, ".pptx": _read_pptx_text}
+    reader = readers.get(ext)
+    if reader is None:
+        raise ValueError(f"Unsupported file type: {ext}")
+    try:
+        return reader(data)
+    except ImportError as e:
+        raise RuntimeError(
+            f"Missing library to parse {ext} files — pip install "
+            f"{'python-docx' if ext == '.docx' else 'pypdf' if ext == '.pdf' else 'python-pptx'}"
+        ) from e
+
+
 def schema_errors(inv: dict) -> list[str]:
     errs, ids = [], set()
     for i, e in enumerate(inv.get("entries", [])):
@@ -230,6 +278,11 @@ html, body, [data-testid="stAppViewContainer"] { font-family:'Source Sans 3',sys
 [data-testid="stHeader"] { background:transparent; }
 [data-testid="stSidebar"] { background:#1F2933; }
 [data-testid="stSidebar"] * { color:#E6EAEE !important; font-family:'Source Sans 3',system-ui,sans-serif; }
+/* Streamlit's icon glyphs (sidebar collapse arrow, uploader icon) are ligature text in a
+   dedicated icon font — the blanket font-family rule above broke them into literal words. */
+[data-testid="stIconMaterial"], .material-icons, .material-symbols-rounded {
+  font-family: 'Material Symbols Rounded', 'Material Icons' !important;
+}
 h1,h2,h3 { font-family:'Source Sans 3',system-ui,sans-serif; font-weight:700; color:#1F2933 !important; letter-spacing:-.01em; }
 p, span, label, div { color:#1F2933; }
 [data-testid="stMetric"] { background:#FFFFFF; border:1px solid #E3E8EE; border-radius:10px;
@@ -250,6 +303,24 @@ p, span, label, div { color:#1F2933; }
 }
 /* Secondary / plain buttons (e.g. checkbox-adjacent, radio) keep readable text on light bg */
 [data-testid="stRadio"] label, [data-testid="stCheckbox"] label { color:#1F2933 !important; }
+
+/* File uploader (sidebar) — dark dropzone matches the sidebar card, teal Browse button */
+[data-testid="stFileUploaderDropzone"] {
+  background:#2A3441 !important; border:1px dashed #4A5568 !important; border-radius:8px !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] * { color:#E6EAEE !important; }
+[data-testid="stFileUploaderDropzoneInstructions"] svg { fill:#E6EAEE !important; }
+[data-testid="stFileUploaderDropzone"] button {
+  background:#0E7C7B !important; color:#FFFFFF !important;
+  border:1px solid #0E7C7B !important; border-radius:8px !important; font-weight:600 !important;
+  width:auto !important; height:auto !important; min-width:fit-content !important;
+  white-space:nowrap !important; padding:6px 16px !important;
+}
+[data-testid="stFileUploaderDropzone"] button:hover {
+  background:#0A5C5B !important; border-color:#0A5C5B !important;
+}
+[data-testid="stFileUploaderFile"] { background:#2A3441 !important; border-radius:8px !important; }
+[data-testid="stFileUploaderFile"] * { color:#E6EAEE !important; }
 
 textarea { border-radius:8px !important; color:#1F2933 !important; background:#FFFFFF !important; }
 
@@ -276,7 +347,7 @@ ss.setdefault("bullets", [])        # validated bullets
 ss.setdefault("decisions", {})      # bullet index -> "accepted"|"rejected"
 
 with st.sidebar:
-    st.markdown(f"### CV·AGENT <span style='color:{TEAL}'>▮</span>", unsafe_allow_html=True)
+    st.markdown("### CV Tailoring Agent")
     st.caption("local · evidence-only · v2")
     screen = st.radio("Navigate", ["📇 Inventory", "🎯 Tailor", "✅ Review & Export"], label_visibility="collapsed")
     st.divider()
@@ -285,6 +356,44 @@ with st.sidebar:
     else:
         st.success("Real backend: core/ loaded")
     st.caption(f"{len(ss.inventory.get('entries', []))} inventory entries")
+
+    st.divider()
+    st.markdown("**Import CV**")
+    uploaded = st.file_uploader(
+        "Upload .docx / .pdf / .pptx", type=["docx", "pdf", "pptx"], key="cv_upload"
+    )
+    if uploaded is not None:
+        raw = uploaded.getvalue()
+        upload_dir = Path("data/uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        save_path = upload_dir / uploaded.name
+        save_path.write_bytes(raw)
+        st.caption(f"Saved to {save_path}")
+
+        try:
+            cv_text = extract_cv_text(uploaded.name, raw)
+        except Exception as e:
+            st.error(str(e))
+            cv_text = ""
+
+        if cv_text.strip():
+            with st.expander("Preview extracted text"):
+                st.text(cv_text[:3000] + ("…" if len(cv_text) > 3000 else ""))
+            if st.button("➕ Add as inventory entry", key="cv_add_entry"):
+                existing_ids = {e["id"] for e in ss.inventory.get("entries", [])}
+                base_id = f"upload-{Path(uploaded.name).stem.lower().replace(' ', '-')}"
+                uid, n = base_id, 1
+                while uid in existing_ids:
+                    n += 1
+                    uid = f"{base_id}-{n}"
+                first_line = next((l.strip() for l in cv_text.splitlines() if l.strip()), uploaded.name)
+                ss.inventory.setdefault("entries", []).append({
+                    "id": uid,
+                    "claim": first_line[:120],
+                    "evidence": cv_text.strip()[:5000],
+                    "tags": [],
+                })
+                st.success(f"Added '{uid}' — edit claim/tags on the Inventory screen, then Save.")
 
 errors = schema_errors(ss.inventory)
 
