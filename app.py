@@ -1,267 +1,30 @@
 """
 CV Tailoring Agent v2 — Streamlit front end
 ============================================
-Runs TODAY with zero backend (mock mode) and switches automatically to the
-real backend when core/ modules exist. This file defines the backend contract.
+Thin UI only — all logic (inventory storage, CV extraction, keyword
+matching, rewriting, the anti-fabrication guard, export) lives in the FastAPI
+backend (backend/) and is reached exclusively through client.py over HTTP.
+This file has zero `core.*` imports.
 
-RUN IT:
-    pip install streamlit pyyaml
-    streamlit run app.py
-Optional: pip install python-docx   (enables real .docx export; else .md export)
-Optional: pip install python-docx pypdf python-pptx   (enables CV upload/import below)
-
-BACKEND CONTRACT — implement these in Phase 1/2 and mock mode disappears:
-    core/ingest.py    load_inventory(path: str) -> dict            # {"entries":[...]}
-                      normalize_jd(text: str) -> str
-    core/tailor.py    extract_keywords(jd: str) -> list[dict]      # [{"term","priority"}]
-                      match(keywords, inventory) -> tuple[dict, list]  # (hits: {entry_id:[kw]}, gaps:[kw])
-                      rewrite(entries: list, keywords: list) -> list[dict]  # [{"text","evidence_id"}]
-    core/validate.py  validate_bullets(bullets, inventory) -> list[dict]
-                      # each: {"text","evidence_id","status": "ok"|"blocked","violation": str|None}
-    core/report.py    fit_score(hits, gaps, keywords) -> int       # 0-100 deterministic
-                      export_docx(bullets: list[str]) -> bytes
+RUN IT (two processes):
+    Terminal 1: uvicorn backend.main:app --reload --port 8000
+    Terminal 2: streamlit run app.py
+(or use scripts/run_backend.ps1 and scripts/run_frontend.ps1)
 
 GUARDRAILS BAKED INTO THIS UI (do not remove):
     - Export stays disabled until every changed bullet is accepted/rejected.
     - Blocked bullets are displayed, never hidden.
     - Gap keywords are reported, never auto-filled.
-    - Real data lives in data/inventory.yaml (gitignored); this file ships none.
+    - Real data lives in data/inventory.yaml (gitignored), owned by the backend.
 """
 
 from __future__ import annotations
 
 import html
-import io
-import re
-from pathlib import Path
 
 import streamlit as st
-import yaml
 
-# ---------------------------------------------------------------------------
-# Backend resolution: real core/ modules if present, otherwise mock mode.
-# ---------------------------------------------------------------------------
-MOCK_MODE = False
-try:
-    from core.ingest import load_inventory, normalize_jd            # type: ignore
-    from core.tailor import extract_keywords, match, rewrite        # type: ignore
-    from core.validate import validate_bullets                      # type: ignore
-    from core.report import export_docx, fit_score                  # type: ignore
-except ImportError:
-    MOCK_MODE = True
-
-# ---------------------------------------------------------------------------
-# Mock backend (deleted from the flow automatically once core/ exists).
-# The mock validate is a real miniature of the guard so the demo is honest.
-# ---------------------------------------------------------------------------
-SAMPLE_INVENTORY = {
-    "entries": [
-        {
-            "id": "exp-tcs-001",
-            "claim": "Managed 3 cross-functional Agile teams across ServiceNow ITSM, AWS and Salesforce for a Tier-1 telecom",
-            "evidence": "TCS, Tier-1 Telecom client Malaysia, 2023-present; teams of 8/6/5; ServiceNow, AWS, Salesforce",
-            "tags": ["agile", "servicenow", "aws", "salesforce", "scrum master", "telecom", "stakeholder management"],
-        },
-        {
-            "id": "exp-umg-002",
-            "claim": "Led BA workstream for royalty-platform migration at Universal Music Group",
-            "evidence": "Universal Music Group; business analysis; royalty platform migration; requirements workshops",
-            "tags": ["business analysis", "media", "migration", "requirements"],
-        },
-        {
-            "id": "skill-jira-001",
-            "claim": "Administered Jira boards and sprint dashboards for delivery reporting",
-            "evidence": "Jira administration at TCS and UMG; sprint dashboards; delivery reporting",
-            "tags": ["jira", "reporting", "scrum", "agile delivery"],
-        },
-    ]
-}
-
-
-def _mock_load_inventory(path: str) -> dict:
-    p = Path(path)
-    if p.exists():
-        return yaml.safe_load(p.read_text(encoding="utf-8")) or {"entries": []}
-    return SAMPLE_INVENTORY
-
-
-def _mock_normalize_jd(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()[:15000]
-
-
-def _mock_extract_keywords(jd: str) -> list[dict]:
-    """Pretend-LLM: known tags found in the JD = keywords; plus unknown tech-ish
-    capitalised terms as gaps. Deterministic on purpose."""
-    low = jd.lower()
-    kws: list[dict] = []
-    seen: set[str] = set()
-    for e in st.session_state.inventory["entries"]:
-        for t in e["tags"]:
-            if t in low and t not in seen:
-                seen.add(t)
-                kws.append({"term": t, "priority": "must"})
-    for term in re.findall(r"\b[A-Z][A-Za-z+#]{3,}\b", jd):
-        t = term.lower()
-        if t not in seen and t not in {"senior", "years", "agile"} and len(kws) < 18:
-            seen.add(t)
-            kws.append({"term": t, "priority": "nice"})
-    return kws
-
-
-def _mock_match(keywords: list[dict], inventory: dict, threshold: int = 85) -> tuple[dict, list]:
-    hits: dict[str, list] = {}
-    gaps: list[dict] = []
-    for kw in keywords:
-        found = None
-        for e in inventory["entries"]:
-            hay = " ".join(e["tags"]) + " " + e["claim"].lower()
-            if kw["term"] in hay:
-                found = e["id"]
-                break
-        if found:
-            hits.setdefault(found, []).append(kw)
-        else:
-            gaps.append(kw)
-    return hits, gaps
-
-
-def _mock_rewrite(entries: list, keywords: list) -> list[dict]:
-    bullets = [
-        {
-            "text": f"Led delivery grounded in: {e['claim']}",
-            "evidence_id": e["id"],
-        }
-        for e in entries
-    ]
-    if entries:  # seeded fabrication so the guard is visible in the demo
-        bullets.append({"text": "Certified Terraform practitioner managing IaC pipelines", "evidence_id": entries[0]["id"]})
-    return bullets
-
-
-_VERB_ALLOW = {"led", "certified", "improved", "managed", "administered",
-               "delivered", "drove", "built", "owned", "coordinated"}
-
-
-def _mock_validate(bullets: list[dict], inventory: dict) -> list[dict]:
-    by_id = {e["id"]: e for e in inventory["entries"]}
-    out = []
-    for b in bullets:
-        e = by_id.get(b["evidence_id"])
-        if e is None:
-            out.append({**b, "status": "blocked", "violation": f"unknown evidence_id {b['evidence_id']}"})
-            continue
-        hay = (e["claim"] + " " + e["evidence"]).lower()
-        bad = None
-        # numbers/metrics must exist in the cited evidence
-        for n in re.findall(r"\d[\d,.]*%?", b["text"]):
-            if n.rstrip("%") not in hay:
-                bad = n
-                break
-        # named skills/tools (capitalized tokens) must exist too, verbs excused
-        if bad is None:
-            for tok in re.findall(r"\b[A-Z][A-Za-z]{3,}\b", b["text"]):
-                if tok.lower() not in hay and tok.lower() not in _VERB_ALLOW:
-                    bad = tok
-                    break
-        if bad:
-            out.append({**b, "status": "blocked", "violation": f'token "{bad}" not found in evidence {e["id"]}'})
-        else:
-            out.append({**b, "status": "ok", "violation": None})
-    return out
-
-
-def _mock_fit_score(hits: dict, gaps: list, keywords: list) -> int:
-    w = lambda k: 3 if k["priority"] == "must" else 1  # noqa: E731
-    total = sum(w(k) for k in keywords) or 1
-    got = sum(w(k) for kws in hits.values() for k in kws)
-    return round(100 * got / total)
-
-
-def _mock_export_docx(bullets: list[str]) -> bytes:
-    try:
-        from docx import Document  # type: ignore
-
-        doc = Document()
-        doc.add_heading("Tailored CV bullets", level=1)
-        for b in bullets:
-            doc.add_paragraph(b, style="List Bullet")
-        buf = io.BytesIO()
-        doc.save(buf)
-        return buf.getvalue()
-    except ImportError:
-        return ("# Tailored CV bullets\n" + "\n".join(f"- {b}" for b in bullets)).encode()
-
-
-if MOCK_MODE:
-    load_inventory, normalize_jd = _mock_load_inventory, _mock_normalize_jd
-    extract_keywords, match, rewrite = _mock_extract_keywords, _mock_match, _mock_rewrite
-    validate_bullets, fit_score, export_docx = _mock_validate, _mock_fit_score, _mock_export_docx
-
-# ---------------------------------------------------------------------------
-# Schema check (mirrors pydantic model to come in core/ingest.py)
-# ---------------------------------------------------------------------------
-def _read_docx_text(data: bytes) -> str:
-    from docx import Document  # type: ignore
-
-    doc = Document(io.BytesIO(data))
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-
-def _read_pdf_text(data: bytes) -> str:
-    from pypdf import PdfReader  # type: ignore
-
-    reader = PdfReader(io.BytesIO(data))
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
-
-
-def _read_pptx_text(data: bytes) -> str:
-    from pptx import Presentation  # type: ignore
-
-    prs = Presentation(io.BytesIO(data))
-    lines = []
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if not shape.has_text_frame:
-                continue
-            for para in shape.text_frame.paragraphs:
-                line = "".join(run.text for run in para.runs)
-                if line.strip():
-                    lines.append(line)
-    return "\n".join(lines)
-
-
-def extract_cv_text(filename: str, data: bytes) -> str:
-    """Best-effort text extraction for uploaded CVs. Raises if the required
-    optional library isn't installed or the format is unsupported."""
-    ext = Path(filename).suffix.lower()
-    readers = {".docx": _read_docx_text, ".pdf": _read_pdf_text, ".pptx": _read_pptx_text}
-    reader = readers.get(ext)
-    if reader is None:
-        raise ValueError(f"Unsupported file type: {ext}")
-    try:
-        return reader(data)
-    except ImportError as e:
-        raise RuntimeError(
-            f"Missing library to parse {ext} files — pip install "
-            f"{'python-docx' if ext == '.docx' else 'pypdf' if ext == '.pdf' else 'python-pptx'}"
-        ) from e
-
-
-def schema_errors(inv: dict) -> list[str]:
-    errs, ids = [], set()
-    for i, e in enumerate(inv.get("entries", [])):
-        for f in ("id", "claim", "evidence", "tags"):
-            if not e.get(f):
-                errs.append(f"entry {i}: missing '{f}'")
-        eid = e.get("id")
-        if eid:
-            if eid in ids:
-                errs.append(f"duplicate id '{eid}'")
-            ids.add(eid)
-        if e.get("tags") and not isinstance(e["tags"], list):
-            errs.append(f"entry {i}: tags must be a list")
-    return errs
-
+import client
 
 # ---------------------------------------------------------------------------
 # App state
@@ -314,12 +77,10 @@ p, span, label, div { color:#1F2933; }
 .st-key-logo_home button:hover p { color:#2DBDBA !important; }
 .st-key-logo_home { margin-bottom:-4px; }
 
-/* File uploader (sidebar) — dark dropzone matches the sidebar card, teal Browse button */
+/* File uploader (content area) — subtle card dropzone, teal Browse button */
 [data-testid="stFileUploaderDropzone"] {
-  background:#2A3441 !important; border:1px dashed #4A5568 !important; border-radius:8px !important;
+  background:#FFFFFF !important; border:1px dashed #9AD5D4 !important; border-radius:8px !important;
 }
-[data-testid="stFileUploaderDropzoneInstructions"] * { color:#E6EAEE !important; }
-[data-testid="stFileUploaderDropzoneInstructions"] svg { fill:#E6EAEE !important; }
 [data-testid="stFileUploaderDropzone"] button {
   background:#0E7C7B !important; color:#FFFFFF !important;
   border:1px solid #0E7C7B !important; border-radius:8px !important; font-weight:600 !important;
@@ -329,8 +90,6 @@ p, span, label, div { color:#1F2933; }
 [data-testid="stFileUploaderDropzone"] button:hover {
   background:#0A5C5B !important; border-color:#0A5C5B !important;
 }
-[data-testid="stFileUploaderFile"] { background:#2A3441 !important; border-radius:8px !important; }
-[data-testid="stFileUploaderFile"] * { color:#E6EAEE !important; }
 
 textarea, input[type="text"] { border-radius:8px !important; color:#1F2933 !important; background:#FFFFFF !important; }
 
@@ -345,16 +104,22 @@ textarea, input[type="text"] { border-radius:8px !important; color:#1F2933 !impo
 .cva-ev-err{color:#B4423A;background:#F9ECEB}
 .cva-gapbox{background:#FBF3F2;border:1px solid #E5B7B2;border-radius:10px;padding:12px 16px;margin:8px 0;color:#1F2933}
 
-/* Sidebar upload callout — overrides the blanket light-text rule below so it reads on the dark card */
-.cva-sidebar-cta{background:rgba(14,124,123,.22);border:1px solid #0E7C7B;border-radius:8px;
-  padding:10px 12px;margin:10px 0;font-size:.85rem;line-height:1.4}
-.cva-sidebar-cta, .cva-sidebar-cta *{color:#E6EAEE !important}
+/* Content-area import callout */
+.cva-import-cta{background:#E3F2F1;border:1px solid #9AD5D4;border-radius:8px;
+  padding:10px 12px;margin:10px 0;font-size:.85rem;line-height:1.4;color:#0A5C5B}
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)
 
+if not client.is_backend_up():
+    st.error(
+        "**Backend offline** — start it with `uvicorn backend.main:app --reload` "
+        "(or run `scripts/run_backend.ps1`), then reload this page."
+    )
+    st.stop()
+
 ss = st.session_state
-ss.setdefault("inventory", load_inventory("data/inventory.yaml"))
+ss.setdefault("inventory", client.get_inventory())
 ss.setdefault("run", None)          # {"keywords","hits","gaps","score"}
 ss.setdefault("run_id", 0)          # nonce: isolates widget keys per run (stale-state fix)
 ss.setdefault("ticked", set())      # entry ids selected for rewrite
@@ -372,57 +137,43 @@ with st.sidebar:
     st.caption(f"local · evidence-only · v2 · {len(ss.inventory.get('entries', []))} entries")
     screen = st.radio("Navigate", ["📇 Inventory", "🎯 Tailor", "✅ Review & Export"],
                        key="nav_radio", label_visibility="collapsed")
-    if MOCK_MODE:
-        st.warning("MOCK MODE — core/ not found. Build Phase 1 to go live.", icon="⚠️")
-    st.divider()
 
-    st.markdown("**Import CV**")
-    uploaded = st.file_uploader(
-        "Upload .docx / .pdf / .pptx", type=["docx", "pdf", "pptx"], key="cv_upload"
+try:
+    errors = client.validate_inventory(ss.inventory)
+except client.BackendError as e:
+    st.error(f"Couldn't validate inventory: {e}")
+    errors = []
+
+
+def _render_import_preview(cv_text: str, source_label: str, base_id: str, widget_prefix: str) -> None:
+    st.markdown(
+        f"<div class='cva-import-cta'>📄 Extracted {len(cv_text):,} characters from "
+        f"<b>{html.escape(source_label)}</b> — add tags below, then add it as an entry.</div>",
+        unsafe_allow_html=True,
     )
-    if uploaded is not None:
-        raw = uploaded.getvalue()
-        upload_dir = Path("data/uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        save_path = upload_dir / uploaded.name
-        save_path.write_bytes(raw)
+    tags_input = st.text_input(
+        "Tags (comma-separated, required)", key=f"{widget_prefix}_add_tags",
+        placeholder="e.g. scrum-master, agile",
+    )
+    tags = [t.strip() for t in tags_input.split(",") if t.strip()]
+    if st.button("➕ Add as inventory entry", key=f"{widget_prefix}_add_entry",
+                 use_container_width=True, disabled=not tags):
+        existing_ids = {e["id"] for e in ss.inventory.get("entries", [])}
+        uid, n = base_id, 1
+        while uid in existing_ids:
+            n += 1
+            uid = f"{base_id}-{n}"
+        first_line = next((l.strip() for l in cv_text.splitlines() if l.strip()), source_label)
+        ss.inventory.setdefault("entries", []).append({
+            "id": uid,
+            "claim": first_line[:120],
+            "evidence": cv_text.strip()[:5000],
+            "tags": tags,
+        })
+        st.success(f"Added '{uid}' — refine claim/tags below, then Save.")
+    with st.expander("Preview extracted text"):
+        st.text(cv_text[:3000] + ("…" if len(cv_text) > 3000 else ""))
 
-        try:
-            cv_text = extract_cv_text(uploaded.name, raw)
-        except Exception as e:
-            st.error(str(e))
-            cv_text = ""
-
-        if cv_text.strip():
-            st.markdown(
-                f"<div class='cva-sidebar-cta'>📄 Extracted {len(cv_text):,} characters from "
-                f"<b>{html.escape(uploaded.name)}</b> — add tags below, then add it as an entry.</div>",
-                unsafe_allow_html=True,
-            )
-            tags_input = st.text_input(
-                "Tags (comma-separated, required)", key="cv_add_tags", placeholder="e.g. scrum-master, agile"
-            )
-            tags = [t.strip() for t in tags_input.split(",") if t.strip()]
-            if st.button("➕ Add as inventory entry", key="cv_add_entry",
-                         use_container_width=True, disabled=not tags):
-                existing_ids = {e["id"] for e in ss.inventory.get("entries", [])}
-                base_id = f"upload-{Path(uploaded.name).stem.lower().replace(' ', '-')}"
-                uid, n = base_id, 1
-                while uid in existing_ids:
-                    n += 1
-                    uid = f"{base_id}-{n}"
-                first_line = next((l.strip() for l in cv_text.splitlines() if l.strip()), uploaded.name)
-                ss.inventory.setdefault("entries", []).append({
-                    "id": uid,
-                    "claim": first_line[:120],
-                    "evidence": cv_text.strip()[:5000],
-                    "tags": tags,
-                })
-                st.success(f"Added '{uid}' — refine claim/tags on the Inventory screen, then Save.")
-            with st.expander("Preview extracted text"):
-                st.text(cv_text[:3000] + ("…" if len(cv_text) > 3000 else ""))
-
-errors = schema_errors(ss.inventory)
 
 # ---------------------------------------------------------------------------
 # S1 — INVENTORY
@@ -437,9 +188,26 @@ if screen == "📇 Inventory":
     elif entries:
         st.success("SCHEMA VALID ✓")
 
+    st.markdown("**Import CV**")
+    uploaded = st.file_uploader(
+        "Upload .docx / .pdf / .pptx", type=["docx", "pdf", "pptx"], key="cv_upload"
+    )
+    if uploaded is not None:
+        try:
+            result = client.upload_cv(uploaded.name, uploaded.getvalue())
+        except client.BackendError as e:
+            st.error(str(e))
+        else:
+            cv_text = result["text"]
+            if cv_text.strip():
+                base_id = f"upload-{uploaded.name.rsplit('.', 1)[0].lower().replace(' ', '-')}"
+                _render_import_preview(cv_text, uploaded.name, base_id, "cv")
+
+    st.divider()
+
     ss.setdefault("show_manual_entry", False)
     if not entries and not ss.show_manual_entry:
-        st.info("No entries yet — upload a CV from the sidebar, or add one manually below.")
+        st.info("No entries yet — import a CV above, or add one manually below.")
         if st.button("➕ Add a blank entry"):
             ss.show_manual_entry = True
             st.rerun()
@@ -458,13 +226,12 @@ if screen == "📇 Inventory":
                     for r in edited if r.get("id")
                 ]
             }
-            errs = schema_errors(new_inv)
-            if errs:
-                st.error("Not saved:\n\n- " + "\n- ".join(errs))
+            try:
+                saved = client.save_inventory(new_inv)
+            except client.BackendError as e:
+                st.error(f"Not saved:\n\n{e}")
             else:
-                Path("data").mkdir(exist_ok=True)
-                Path("data/inventory.yaml").write_text(yaml.safe_dump(new_inv, sort_keys=False), encoding="utf-8")
-                ss.inventory = new_inv
+                ss.inventory = saved
                 ss.show_manual_entry = False
                 ss.run, ss.bullets, ss.decisions, ss.ticked = None, [], {}, set()  # invalidate stale run
                 st.success("Saved. Previous tailor run cleared.")
@@ -483,16 +250,13 @@ elif screen == "🎯 Tailor":
     if st.button("Run tailor →", type="primary", disabled=not jd.strip()):
         try:
             with st.spinner("Extracting keywords…"):
-                jd_n = normalize_jd(jd)
-                keywords = extract_keywords(jd_n)
-                hits, gaps = match(keywords, ss.inventory)
-        except Exception as e:
+                r = client.run_tailor(jd)
+        except client.BackendError as e:
             st.error(f"Couldn't run tailor: {e}")
         else:
-            ss.run = {"keywords": keywords, "hits": hits, "gaps": gaps,
-                      "score": fit_score(hits, gaps, keywords)}
+            ss.run = r
             ss.run_id += 1
-            ss.ticked = set(hits.keys())
+            ss.ticked = set(r["hits"].keys())
             ss.bullets, ss.decisions = [], {}
 
     if ss.run:
@@ -536,12 +300,10 @@ elif screen == "🎯 Tailor":
             )
 
         if st.button("Rewrite selected evidence →", disabled=not ss.ticked):
-            entries = [by_id[i] for i in ss.ticked if i in by_id]  # guard: ids may have been deleted
             try:
                 with st.spinner("Rewriting bullets…"):
-                    raw = rewrite(entries, r["keywords"])
-                    ss.bullets = validate_bullets(raw, ss.inventory)
-            except Exception as e:
+                    ss.bullets = client.rewrite_bullets(list(ss.ticked), r["keywords"])
+            except client.BackendError as e:
                 st.error(f"Couldn't rewrite: {e}")
             else:
                 ss.decisions = {}
@@ -586,12 +348,16 @@ else:
         st.button(f"⬇ Export DOCX — locked ({pending} pending)", disabled=True)
         st.caption("Guardrail #2: nothing exports until every bullet has your explicit decision.")
     else:
-        data = export_docx(accepted)
-        is_docx = data[:2] == b"PK"
-        st.download_button(
-            "⬇ Export tailored bullets",
-            data=data,
-            file_name="tailored_cv." + ("docx" if is_docx else "md"),
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document" if is_docx else "text/markdown",
-        )
-        st.caption(f"{len(accepted)} accepted bullets.")
+        try:
+            data = client.export_docx(accepted)
+        except client.BackendError as e:
+            st.error(f"Couldn't export: {e}")
+        else:
+            is_docx = data[:2] == b"PK"
+            st.download_button(
+                "⬇ Export tailored bullets",
+                data=data,
+                file_name="tailored_cv." + ("docx" if is_docx else "md"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document" if is_docx else "text/markdown",
+            )
+            st.caption(f"{len(accepted)} accepted bullets.")
